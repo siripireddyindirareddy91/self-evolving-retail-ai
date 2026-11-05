@@ -1623,7 +1623,7 @@ export default function RetailApp() {
                     <div className="row">
                       <select
                         aria-label="Forecast product"
-                        defaultValue=""
+                        value={data.product || ""}
                         onChange={async (e) => {
                           try {
                             setData(
@@ -1631,7 +1631,7 @@ export default function RetailApp() {
                                 "analytics/forecast" +
                                   filter +
                                   "&product=" +
-                                  e.target.value,
+                                  e.target.value + "&horizon=" + (data.horizon || 30),
                               ),
                             );
                           } catch (err) {
@@ -1648,7 +1648,7 @@ export default function RetailApp() {
                       </select>
                       <select
                         aria-label="Forecast horizon"
-                        defaultValue="30"
+                        value={String(data.horizon || 30)}
                         onChange={async (e) => {
                           try {
                             setData(
