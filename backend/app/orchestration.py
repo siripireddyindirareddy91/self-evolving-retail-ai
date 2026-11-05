@@ -10,7 +10,7 @@ from .database import Session, Episode, Reflection, ToolExecution, Setting, uid,
 from . import analytics
 
 AGENTS=[('supervisor','Retail Supervisor','Classifies tasks and combines evidence'),('sales','Sales Analytics','Revenue, margin, product and regional analysis'),('customers','Customer Intelligence','RFM segmentation and observed retention'),('inventory','Inventory Intelligence','Stock coverage and replenishment'),('forecast','Demand Forecasting','Time-aware regression with holdout validation'),('anomalies','Anomaly Detection','Isolation Forest statistical flags'),('memory','Memory','Owner-scoped episode retrieval'),('reflection','Reflection','Evaluate data coverage and execution outcomes'),('tools','Adaptive Tool Selection','Explainable reliability-weighted selection'),('reports','Report Generation','Executive findings and exports')]
-TOOLS=[('sales','Sales Calculation Tool',['sales','report'],'Aggregates actual transaction values'),('customers','Customer Segmentation Tool',['customers','report'],'K-Means and repeat purchase calculations'),('inventory','Inventory Analysis Tool',['inventory','report'],'Recorded stock and observed demand'),('forecast','Demand Forecasting Tool',['forecast','report'],'Linear regression and chronological holdout'),('anomalies','Anomaly Detection Tool',['anomalies','report'],'Isolation Forest on daily patterns')]
+TOOLS=[('sales','Sales Calculation Tool',['sales','report'],'Aggregates actual transaction values'),('customers','Customer Segmentation Tool',['customers','report'],'K-Means and repeat purchase calculations'),('inventory','Inventory Analysis Tool',['inventory','report'],'Recorded stock and observed demand'),('forecast','Demand Forecasting Tool',['forecast','report'],'Linear regression and chronological holdout'),('anomalies','Anomaly Detection Tool',['anomalies','report'],'Isolation Forest on daily patterns'),('sales_sql','SQL Query Tool',['sales','report'],'Isolated fixed-SQL revenue and profit aggregation'),('forecast_naive','Seasonal Baseline Forecast Tool',['forecast','report'],'Repeat-week forecast with chronological holdout evaluation'),('memory_retrieval','Episodic Memory Retrieval Tool',['memory'],'Owner-scoped TF-IDF episode retrieval'),('visualization','Data Visualization Tool',['visualization'],'Construct chart-ready evidence series from computed results'),('report_generation','Report Generation Tool',['reports'],'Generate evidence-based executive summaries and recommendations')]
 
 class AgentState(TypedDict,total=False):
     query:str
@@ -47,11 +47,16 @@ def tool_registry(owner):
         output.append({'id':id,'name':name,'description':description,'categories':categories,'executions':count,'successRate':round(success/count*100,1) if count else None,'averageDuration':round(sum(r.payload.get('duration',0) for r in history)/count,2) if count else 0,'lastUsed':history[-1].created_at if history else None,'inputSchema':{'dataset':'validated retail rows'},'outputSchema':{'result':'category analytics object'},'status':'Available'})
     return output
 
+def log_tool(owner,tool,duration=0,success=True):
+    with Session() as session:
+        session.add(ToolExecution(owner=owner,tool=tool,payload={'success':success,'duration':duration,'timestamp':now()}));session.commit()
+
 def event(state,step,summary): state['trace'].append({'step':step,'summary':summary,'timestamp':now(),'status':'completed'})
 
 def classify(state):
     q=state['query'].lower(); rules={'forecast':['predict','forecast','next month','future','demand'],'inventory':['stock','inventory','replenish','reorder'],'customers':['customer','churn','retention','segment'],'anomalies':['anomal','unusual','suspicious','outlier'],'sales':['sales','revenue','profit','region','product','margin']}
     categories=[k for k,words in rules.items() if any(w in q for w in words)]
+    if 'sales' in categories and len(categories)>1 and not any(w in q for w in ['sales','revenue','profit','region','margin']):categories.remove('sales')
     if any(w in q for w in ['executive','all areas','business performance']) or ('report' in q and not categories):categories=list(rules)
     if not categories:categories=['sales']
     state['categories']=categories;state['category']=categories[0] if len(categories)==1 else 'report';state['results']={};state['errors']=[]
@@ -59,7 +64,8 @@ def classify(state):
     return state
 
 def retrieve(state):
-    state['memories']=memory_search(state['owner'],state['query']);event(state,'Memory retrieval',f"Retrieved {len(state['memories'])} related episodes using TF-IDF cosine similarity.");return state
+    started=time.perf_counter()
+    state['memories']=memory_search(state['owner'],state['query']);log_tool(state['owner'],'memory_retrieval',(time.perf_counter()-started)*1000);event(state,'Memory retrieval',f"Retrieved {len(state['memories'])} related episodes using TF-IDF cosine similarity.");return state
 
 def select_tools(state):
     registry=tool_registry(state['owner']); selected=[]
@@ -68,8 +74,10 @@ def select_tools(state):
         candidates=[t for t in registry if cat in t['categories']]
         for t in candidates:
             reliability=(t['successRate']/100) if t['successRate'] is not None else .5
-            t['selectionScore']=round(.8+.2*reliability if adaptive else 1.,3)
-            t['selectionExplanation']=f"Category match; {'80% relevance + 20% observed reliability' if adaptive else 'adaptation disabled'}; {t['executions']} recorded executions."
+            relevance=.78 if t['id'] in ['sales_sql','forecast_naive'] else .8
+            t['category']=cat
+            t['selectionScore']=round(relevance+.2*reliability if adaptive else relevance,3)
+            t['selectionExplanation']=f"Category match; {'category relevance + 20% observed reliability; alternatives compete on logged outcomes' if adaptive else 'adaptation disabled'}; {t['executions']} recorded executions."
         selected.extend(sorted(candidates,key=lambda t:t['selectionScore'],reverse=True)[:1])
     state['selected']=selected;event(state,'Adaptive tool selection','; '.join(t['name']+': '+str(t['selectionScore']) for t in selected));return state
 
@@ -81,13 +89,21 @@ def execute_tool(state,tool):
     success=result is not None
     with Session() as s:
         s.add(ToolExecution(owner=state['owner'],tool=tool['id'],payload={'success':success,'duration':round((time.perf_counter()-start)*1000,2),'error':None if success else error,'selectionScore':tool['selectionScore'],'category':state['category'],'timestamp':now()}));s.commit()
-    return tool['id'],result,None if success else error
+    return tool.get('category',tool['id']),result,None if success else error
 
 def execute_single(state):return execute(state)
 def execute_parallel(state):return execute(state)
 def execute(state):
     with ThreadPoolExecutor(max_workers=4) as pool:outputs=list(pool.map(lambda t:execute_tool(state,t),state['selected']))
     for name,result,error in outputs:
+        if error:
+            primary=next((t for t in state['selected'] if t.get('category')==name),None)
+            alternatives=[t for t in tool_registry(state['owner']) if name in t['categories'] and t['id']!=(primary or {}).get('id')]
+            if alternatives:
+                fallback={**alternatives[0],'category':name,'selectionScore':0,'selectionExplanation':'Fallback after primary failed twice.'}
+                state['selected']=[fallback if t is primary else t for t in state['selected']]
+                event(state,'Fallback decision',f"{(primary or {}).get('name',name)} failed; retrying with {fallback['name']}.")
+                name,result,error=execute_tool(state,fallback)
         if error:state['errors'].append({'tool':name,'error':error})
         else:state['results'][name]=result
     event(state,'Specialist execution',f"Executed {len(outputs)} analytical tools; {len(state['errors'])} errors. Calculations use {len(state['df'])} validated retail rows.")
@@ -101,6 +117,7 @@ def validate(state):
     event(state,'Validation and reflection',f"Execution completeness score {score}/100. Recommendation quality requires user/outcome feedback.");return state
 
 def summarize(state):
+    report_started=time.perf_counter()
     results=state['results']; findings=[]; recommendations=[]
     if 'sales' in results:
         r=results['sales'];findings.append(f"Revenue is ${r['revenue']:,.2f}; observed profit is ${r['profit']:,.2f}. Trailing 30-day growth is {r['growth']:+.1f}%.");recommendations.append('Review the largest product and regional changes before adjusting campaigns.')
@@ -117,8 +134,13 @@ def summarize(state):
             import httpx
             response=httpx.post(os.getenv('OPENAI_BASE_URL','https://api.openai.com/v1').rstrip('/')+'/chat/completions',headers={'Authorization':'Bearer '+os.environ['OPENAI_API_KEY']},json={'model':os.getenv('OPENAI_MODEL','gpt-4.1-mini'),'messages':[{'role':'system','content':'Summarize the supplied computed retail findings. Do not invent values, claim causality, or expose reasoning. Under 180 words.'},{'role':'user','content':summary}],'max_tokens':400},timeout=20);response.raise_for_status();summary=response.json()['choices'][0]['message']['content'];mode='LLM-assisted summary; local analytical execution'
         except Exception as exc:state['reflection']['limitations'].append('Configured LLM unavailable; analytical rule-based summary used.');event(state,'LLM fallback',type(exc).__name__)
+    chart_started=time.perf_counter();charts={}
+    if 'sales' in results:charts['revenueTrend']=results['sales']['revenueTrend'];charts['categories']=results['sales']['categories']
+    if 'forecast' in results:charts['forecast']=results['forecast']['forecast']
+    if 'customers' in results:charts['segments']=results['customers']['segments']
+    log_tool(state['owner'],'visualization',(time.perf_counter()-chart_started)*1000);log_tool(state['owner'],'report_generation',(time.perf_counter()-report_started)*1000)
     duration=round((time.perf_counter()-state['started'])*1000,2);episode_id=uid()
-    episode={'id':episode_id,'query':state['query'],'category':state['category'],'createdAt':now(),'agents':['supervisor','memory','tools',*state['categories'],'reflection','reports'],'tools':[t['name'] for t in state['selected']],'selectedTools':state['selected'],'dataset':state['dataset'],'summary':summary,'result':results,'recommendations':recommendations,'confidence':state['reflection']['score']/100,'confidenceLabel':'Execution completeness, not prediction probability','duration':duration,'status':state['reflection']['outcome'],'reflection':state['reflection'],'trace':state['trace'],'memoryReferences':[{'id':e['id'],'query':e['query'],'similarity':e['similarity']} for e in state['memories']],'feedback':None,'mode':mode}
+    episode={'id':episode_id,'query':state['query'],'category':state['category'],'createdAt':now(),'agents':['supervisor','memory','tools',*state['categories'],'reflection','reports'],'tools':[t['name'] for t in state['selected']],'selectedTools':state['selected'],'dataset':state['dataset'],'period':{'start':state['df'].order_date.min(),'end':state['df'].order_date.max()},'summary':summary,'result':results,'recommendations':recommendations,'confidence':state['reflection']['score']/100,'confidenceLabel':'Execution completeness, not prediction probability','duration':duration,'status':state['reflection']['outcome'],'reflection':state['reflection'],'trace':state['trace'],'memoryReferences':[{'id':e['id'],'query':e['query'],'similarity':e['similarity']} for e in state['memories']],'feedback':None,'mode':mode,'charts':charts}
     event(state,'Memory update','Saved episode, tool execution statistics and reflection; future requests can retrieve this experience.')
     with Session() as s:
         s.add(Episode(id=episode_id,owner=state['owner'],category=state['category'],payload=episode));s.flush();s.add(Reflection(episode_id=episode_id,owner=state['owner'],payload=state['reflection']));s.commit()

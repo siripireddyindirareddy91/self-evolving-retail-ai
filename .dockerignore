@@ -1,0 +1,15 @@
+.git
+.next
+.vercel
+.venv
+node_modules
+__pycache__
+*.pyc
+*.db
+.env
+.env.local
+.env.production
+*.tsbuildinfo
+
+.env*
+!.env.example

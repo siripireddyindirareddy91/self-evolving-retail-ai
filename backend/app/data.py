@@ -35,7 +35,11 @@ REQUIRED=['order_id','order_date','customer_id','product_id','product_name','cat
 
 def clean_records(records, mapping=None):
     df=pd.DataFrame(records)
-    if mapping: df=df.rename(columns=mapping)
+    if mapping:
+        if not all(isinstance(k,str) and isinstance(v,str) for k,v in mapping.items()): raise ValueError('Column mapping keys and values must be strings')
+        if len(set(mapping.values()))!=len(mapping): raise ValueError('Each destination field may be mapped only once')
+        df=df.rename(columns=mapping)
+        if df.columns.duplicated().any(): raise ValueError('Column mapping creates duplicate destination fields')
     aliases={'date':'order_date','sales':'revenue','price':'unit_price','product':'product_name','customer':'customer_id','stock':'inventory_stock'}
     df=df.rename(columns={k:v for k,v in aliases.items() if k in df and v not in df})
     missing=[c for c in REQUIRED if c not in df]

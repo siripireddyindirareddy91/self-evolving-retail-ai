@@ -9,6 +9,3 @@ __pycache__/
 .pytest_cache/
 .venv/
 *.tsbuildinfo
-
-.vercel
-.env*

@@ -12,7 +12,7 @@ Local SQLite persists across restarts. Vercel `/tmp` storage is ephemeral and is
 
 ## Agent workflow
 
-The compiled LangGraph state machine performs supervisor classification, TF-IDF memory retrieval, transparent reliability-weighted tool ranking, conditional single/parallel specialist execution, validation/reflection, then episode persistence. Tools retry once on exceptions. Provider HTTP requests have a 20-second timeout; Vercel limits the overall function to 60 seconds. LLM output summarizes computed results only when a server-side key is configured. Fallback mode is always labeled.
+The compiled LangGraph state machine performs supervisor classification, TF-IDF memory retrieval, transparent reliability-weighted tool ranking with competing SQL/pandas and regression/seasonal-naive strategies, conditional single/parallel specialist execution, validation/reflection, then episode persistence. Tools retry once on exceptions, then try a registered alternative where one exists. Measured failures reduce reliability so future requests can select a different strategy. Provider HTTP requests have a 20-second timeout; Vercel limits the overall function to 60 seconds. LLM output summarizes computed results only when a server-side key is configured. Fallback mode is always labeled.
 
 Improvement is controlled historical ranking, versioned reversible routing settings, and retrieved experience. No weights are retrained. Confidence measures execution completeness; recommendation quality and tool-selection correctness remain unmeasured until feedback or actual outcomes are supplied.
 
@@ -30,4 +30,4 @@ Semantic retrieval currently uses TF-IDF cosine similarity. External embeddings,
 
 ## Verification
 
-Run `python -m unittest discover -s backend/tests -v`. Six integration/analytical tests cover aggregation invariants, K-Means segment counts, inventory, holdout forecasting, anomaly flags, schema validation, duplicate cleaning, the five-specialist workflow, owner isolation, memory retrieval, reflection persistence, feedback, PDF/CSV exports, dataset upload/selection and reversible settings.
+Run `python -m unittest discover -s backend/tests -v`. Eight integration/analytical tests cover aggregation invariants, K-Means segment counts, inventory, holdout forecasting, anomaly flags, schema validation, duplicate cleaning, the five-specialist workflow, owner isolation, memory retrieval, reflection persistence, feedback, PDF/CSV exports, dataset upload/selection and reversible settings.

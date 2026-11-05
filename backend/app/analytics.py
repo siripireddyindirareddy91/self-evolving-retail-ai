@@ -16,7 +16,7 @@ def sales(df):
     products=df.groupby(['product_id','product_name'],as_index=False).agg(revenue=('revenue','sum'),quantity=('quantity','sum'),profit=('profit','sum')).sort_values('revenue',ascending=False).rename(columns={'product_name':'name'})
     regions=df.groupby('region',as_index=False).revenue.sum().rename(columns={'region':'name'})
     end=pd.to_datetime(df.order_date).max(); dates=pd.to_datetime(df.order_date)
-    current=df[dates>end-pd.Timedelta(days=30)].revenue.sum(); prev=df[(dates<=end-pd.Timedelta(days=30))&(dates>end-pd.Timedelta(days=60))].revenue.sum()
+    current=df.attrs.get('comparisonCurrent',df[dates>end-pd.Timedelta(days=30)].revenue.sum()); prev=df.attrs.get('comparisonPrevious',df[(dates<=end-pd.Timedelta(days=30))&(dates>end-pd.Timedelta(days=60))].revenue.sum())
     return {'revenueTrend':records(daily.round(2)),'monthly':records(monthly.round(2)),'categories':records(cats.round(2)),'products':records(products.round(2)),'regions':records(regions.round(2)),'revenue':money(df.revenue.sum()),'profit':money(df.profit.sum()),'growth':money((current/prev-1)*100) if prev else 0,'period':{'start':df.order_date.min(),'end':df.order_date.max()}}
 
 def customers(df):
@@ -71,3 +71,21 @@ def overview(df):
     s=sales(df); c=customers(df); i=inventory(df); orders=df.order_id.nunique()
     insights=[f"Trailing 30-day revenue changed {s['growth']:+.1f}% versus the previous 30 days.",f"{s['products'][0]['name']} leads product revenue at ${s['products'][0]['revenue']:,.2f}.",f"{i['lowStock']} products are below their recorded reorder level.",f"{c['retention']:.1f}% of observed customers made repeat purchases."]
     return {**s,'kpis':{'revenue':s['revenue'],'orders':int(orders),'customers':c['total'],'aov':money(df.revenue.sum()/orders) if orders else 0,'products':int(df.product_id.nunique()),'inventoryValue':i['inventoryValue'],'growth':s['growth'],'retention':c['retention'],'profit':s['profit']},'segments':c['segments'],'inventory':i['products'],'insights':insights}
+
+def sales_sql(df):
+    """Alternative aggregation strategy: fixed SQL against an isolated in-memory database."""
+    import sqlite3
+    with sqlite3.connect(':memory:') as connection:
+        df[['revenue','profit','order_id']].to_sql('orders',connection,index=False)
+        total=connection.execute('SELECT SUM(revenue), SUM(profit), COUNT(DISTINCT order_id) FROM orders').fetchone()
+    result=sales(df)
+    result['revenue']=money(total[0]);result['profit']=money(total[1]);result['method']='Fixed SQL totals in isolated SQLite; pandas dimensional grouping.'
+    return result
+
+def forecast_naive(df,horizon=30,product=None):
+    """Weekly seasonal baseline with genuine chronological holdout evaluation."""
+    if product:df=df[df.product_id==product]
+    if df.empty:raise ValueError('Product not found')
+    daily=df.groupby('order_date').revenue.sum();dates=pd.date_range(daily.index.min(),daily.index.max());y=daily.reindex(dates.strftime('%Y-%m-%d'),fill_value=0).to_numpy();n=len(y)
+    lag=min(7,n);holdout=min(30,max(0,n-lag));errors=y[-holdout:]-y[-holdout-lag:-lag] if holdout else np.array([0.]);std=float(np.std(errors));last=y[-lag:];pred=np.resize(last,horizon);future=pd.date_range(dates[-1]+pd.Timedelta(days=1),periods=horizon)
+    return {'forecast':[{'date':d.date().isoformat(),'forecast':money(v),'lower':money(max(0,v-1.96*std)),'upper':money(v+1.96*std)} for d,v in zip(future,pred)],'history':[{'date':d.date().isoformat(),'revenue':money(v)} for d,v in zip(dates[-60:],y[-60:])],'totalForecast':money(pred.sum()),'mae':money(np.abs(errors).mean()),'mape':money(np.mean(np.abs(errors)/np.maximum(y[-holdout:],1))*100) if holdout else None,'horizon':horizon,'method':'Seasonal naive: repeat latest observed week; rolling chronological one-week-ahead holdout errors. Bands are approximate.','trainingDays':n,'validationDays':holdout,'product':product}

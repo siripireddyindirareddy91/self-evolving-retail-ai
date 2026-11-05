@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import secrets
+import re
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timezone
@@ -72,6 +73,7 @@ def dataframe(request,dataset_id=None):
 
 def filter_data(request,dataset_id=None,start=None,end=None,period=None):
     df,id=dataframe(request,dataset_id)
+    full_df=df.copy()
     if period and period != 'all':
         import pandas as pd
         try: days=int(str(period).rstrip('d'))
@@ -80,6 +82,10 @@ def filter_data(request,dataset_id=None,start=None,end=None,period=None):
     if start:df=df[df.order_date>=start]
     if end:df=df[df.order_date<=end]
     if df.empty:raise HTTPException(422,'No data in selected period')
+    import pandas as pd
+    cutoff=pd.to_datetime(df.order_date).max(); comparison_dates=pd.to_datetime(full_df.order_date)
+    df.attrs['comparisonCurrent']=float(full_df[(comparison_dates<=cutoff)&(comparison_dates>cutoff-pd.Timedelta(days=30))].revenue.sum())
+    df.attrs['comparisonPrevious']=float(full_df[(comparison_dates<=cutoff-pd.Timedelta(days=30))&(comparison_dates>cutoff-pd.Timedelta(days=60))].revenue.sum())
     return df,id
 
 @app.get('/api/health')
@@ -100,7 +106,12 @@ def analysis(category:str,request:Request,start:str|None=None,end:str|None=None,
 
 @app.post('/api/agents/query')
 def query(body:Query,request:Request):
-    df,id=filter_data(request,dataset_id=body.datasetId or body.dataset_id,period=body.period);return run_query(body.query,owner(request),df,id)
+    period=body.period
+    if not period or period=='all':
+        text=body.query.lower()
+        patterns=[(r'(last|past|previous)\s+(three|3)\s+months|last\s+90\s+days','90d'),(r'(last|past|previous)\s+(six|6)\s+months|last\s+180\s+days','180d'),(r'(last|past|previous)\s+(one\s+)?month|last\s+30\s+days','30d')]
+        period=next((value for pattern,value in patterns if re.search(pattern,text)),period)
+    df,id=filter_data(request,dataset_id=body.datasetId or body.dataset_id,period=period);return run_query(body.query,owner(request),df,id)
 
 @app.get('/api/memory/episodes')
 def episodes(request:Request,search:str=''):
@@ -234,17 +245,32 @@ def generate_report(body:Query,request:Request):return query(body,request)
 def export_report(episode_id:str,request:Request,format:str='pdf'):
     e=episode(episode_id,request)
     if format=='csv':
-        out=io.StringIO();writer=csv.writer(out);writer.writerow(['section','content']);writer.writerow(['query',e['query']]);writer.writerow(['summary',e['summary']]);writer.writerow(['generated_at',e['createdAt']]);writer.writerow(['dataset',e['dataset']]);writer.writerow(['mode',e['mode']])
+        out=io.StringIO();writer=csv.writer(out);writer.writerow(['section','content']);writer.writerow(['query',e['query']]);writer.writerow(['summary',e['summary']]);writer.writerow(['generated_at',e['createdAt']]);writer.writerow(['dataset',e['dataset']]);writer.writerow(['data_period',json.dumps(e.get('period',{}))]);writer.writerow(['mode',e['mode']])
         for rec in e['recommendations']:writer.writerow(['recommendation',rec])
         for category,result in e['result'].items():writer.writerow([category,json.dumps(result)])
-        return Response(out.getvalue(),media_type='text/csv',headers={'Content-Disposition':'attachment; filename="retailmind-report.csv"'})
+        safe=io.StringIO();safe_writer=csv.writer(safe)
+        for row in csv.reader(io.StringIO(out.getvalue())):safe_writer.writerow(["'"+cell if cell.startswith(('=','+','-','@','\t','\r')) else cell for cell in row])
+        return Response(safe.getvalue(),media_type='text/csv',headers={'Content-Disposition':'attachment; filename="retailmind-report.csv"'})
     if format!='pdf':raise HTTPException(422,'format must be pdf or csv')
     from reportlab.platypus import SimpleDocTemplate,Paragraph,Spacer,Table,TableStyle
     from reportlab.lib.styles import getSampleStyleSheet
     from reportlab.lib import colors
     from xml.sax.saxutils import escape
     stream=io.BytesIO();styles=getSampleStyleSheet();story=[Paragraph('RETAILMIND AI | Intelligence Report',styles['Title']),Spacer(1,16)]
-    for heading,value in [('Objective',e['query']),('Generated',e['createdAt']),('Execution mode',e['mode']),('Data source',e['dataset']),('Executive summary',e['summary'])]:story.extend([Paragraph(heading,styles['Heading2']),Paragraph(escape(str(value)),styles['BodyText']),Spacer(1,8)])
+    for heading,value in [('Objective',e['query']),('Generated',e['createdAt']),('Execution mode',e['mode']),('Data source',e['dataset']),('Data period',str(e.get('period',{}).get('start','Unknown'))+' through '+str(e.get('period',{}).get('end','Unknown'))),('Executive summary',e['summary'])]:story.extend([Paragraph(heading,styles['Heading2']),Paragraph(escape(str(value)),styles['BodyText']),Spacer(1,8)])
+    chart_points=[];chart_key='revenue';chart_title='Observed daily revenue'
+    if 'sales' in e['result']:chart_points=e['result']['sales'].get('revenueTrend',[])[-14:]
+    elif 'forecast' in e['result']:chart_points=e['result']['forecast'].get('forecast',[])[:14];chart_key='forecast';chart_title='Forecast daily revenue'
+    elif 'inventory' in e['result']:chart_points=[{'date':p['product_name'][:12],'value':p['inventory_stock']} for p in e['result']['inventory'].get('products',[])[:10]];chart_key='value';chart_title='Recorded inventory units'
+    elif 'customers' in e['result']:chart_points=[{'date':p['name'],'value':p['value']} for p in e['result']['customers'].get('segments',[])];chart_key='value';chart_title='Customer segment counts'
+    elif 'anomalies' in e['result']:chart_points=[{'date':p['order_date'],'revenue':p['revenue']} for p in e['result']['anomalies'].get('anomalies',[])[:14]];chart_title='Flagged daily revenue'
+    if chart_points:
+        from reportlab.graphics.shapes import Drawing
+        from reportlab.graphics.charts.barcharts import VerticalBarChart
+        story.append(Paragraph(chart_title,styles['Heading2']))
+        drawing=Drawing(460,210);chart=VerticalBarChart();chart.x=45;chart.y=55;chart.width=400;chart.height=140
+        chart.data=[[float(p.get(chart_key,0)) for p in chart_points]];chart.categoryAxis.categoryNames=[str(p.get('date',''))[-5:] if len(str(p.get('date','')))==10 else str(p.get('date','')) for p in chart_points]
+        chart.categoryAxis.labels.fontSize=6;chart.categoryAxis.labels.angle=35;chart.valueAxis.labels.fontSize=7;chart.valueAxis.valueMin=0;chart.bars[0].fillColor=colors.HexColor('#7771f9');drawing.add(chart);story.extend([drawing,Spacer(1,10)])
     story.append(Paragraph('Recommendations',styles['Heading2']))
     for value in e['recommendations']:story.extend([Paragraph(escape(value),styles['BodyText']),Spacer(1,7)])
     story.append(Paragraph('Evidence and methods',styles['Heading2']))
